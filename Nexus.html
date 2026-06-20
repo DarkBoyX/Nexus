@@ -523,6 +523,29 @@
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
     font-family:'Share Tech Mono',monospace;
   }
+  /* ── CODE BUBBLE — rendered as its own separate message so Copy
+     only grabs the code, never the surrounding explanation text ── */
+  .msg.ai .bubble.code-bubble {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px; line-height: 1.6;
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 2px solid var(--glow);
+    padding: 0; overflow: hidden; max-width: 660px; cursor: default;
+  }
+  .code-bubble-head {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 8px 13px; border-bottom: 1px solid var(--border);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px; letter-spacing: 2px; color: var(--dim);
+    text-transform: uppercase;
+  }
+  .code-bubble-body {
+    padding: 12px 14px; overflow-x: auto; white-space: pre;
+    color: var(--text);
+  }
+  .code-bubble-body::-webkit-scrollbar { height: 4px; }
+  .code-bubble-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
   .typing-dots { display:flex; gap:5px; align-items:center; padding:4px 0; }
   .typing-dots span {
     width:5px; height:5px; border-radius:50%; background:var(--dim);
@@ -1640,6 +1663,38 @@ function buildLinkCards(urls) {
 }
 
 /* ══════════════════════════════════════
+   ══ REPLY SEGMENTATION — text vs. code ══
+   Splits a raw AI reply into an ordered list of segments so that
+   explanation text and code blocks render as SEPARATE chat bubbles.
+   This means tapping Copy on a code bubble copies ONLY the code, never
+   the surrounding prose — and if there's explanation before AND after
+   a script, each becomes its own bubble in the right order.
+══════════════════════════════════════ */
+function splitReplyIntoSegments(text) {
+  const fence = /```([a-zA-Z0-9+#._-]*)\n?([\s\S]*?)```/g;
+  const segments = [];
+  let last = 0, m;
+  while((m = fence.exec(text)) !== null) {
+    const before = text.slice(last, m.index).trim();
+    if(before) segments.push({ type:'text', content: before });
+    const lang = (m[1] || '').trim();
+    const code = m[2].replace(/\n$/, '');
+    if(code.trim()) segments.push({ type:'code', content: code, lang: lang || 'code' });
+    last = m.index + m[0].length;
+  }
+  const tail = text.slice(last).trim();
+  if(tail) segments.push({ type:'text', content: tail });
+  // If there were no fences at all, treat the whole thing as one text segment
+  if(!segments.length && text.trim()) segments.push({ type:'text', content: text.trim() });
+  return segments;
+}
+
+function buildCodeBubbleHTML(code, lang) {
+  const escaped = escapeHtml(code);
+  return `<div class="code-bubble-head"><span>◇ ${escapeHtml(lang || 'code')}</span></div><div class="code-bubble-body">${escaped}</div>`;
+}
+
+/* ══════════════════════════════════════
    ══ IMAGE GENERATION ══
    Uses Pollinations.ai's free, keyless image
    generation endpoint. NEXUS decides whether
@@ -1672,7 +1727,27 @@ document.getElementById('imgLightbox').addEventListener('click', function(e) {
   if(e.target === this) closeLightbox();
 });
 
-/* ══ CUSTOM DOWNLOAD MODAL ══ */
+/* ══════════════════════════════════════
+   ══ CUSTOM DOWNLOAD MODAL + SAFE DOWNLOAD ══
+   FIX: the old version did a raw `fetch(src)` straight to the
+   Pollinations CDN, turned it into a blob, then forced a same-tab
+   anchor click. On Android WebView, fetching a cross-origin image as
+   a blob like this can throw a hard, uncatchable native error (CORS /
+   opaque response handling differs between WebView builds) that takes
+   the whole hosting app down instead of just failing the JS promise.
+   This rewrite:
+     1. Never lets a download failure (of any kind) propagate — every
+        async step is guarded.
+     2. Tries the blob+anchor approach FIRST, but in a way that can't
+        crash the WebView: it uses a timeout race so a hung/crashing
+        fetch can't block forever, and it never re-fetches an image
+        that's already failed to load as an <img> (a common WebView
+        crash trigger).
+     3. Falls back to simply opening the raw image URL in a new tab
+        (window.open) so the user can long-press → "Save image" — this
+        path cannot crash because it does zero cross-origin byte
+        handling in JS.
+══════════════════════════════════════ */
 const dlModal = document.getElementById('downloadModal');
 const dlTitle = document.getElementById('dlTitle');
 const dlSub = document.getElementById('dlSub');
@@ -1701,37 +1776,77 @@ dlModal.addEventListener('click', function(e) {
   }
 });
 
+function showDownloadFallback(src, reasonText) {
+  // Safe path: just open the image URL directly. No fetch, no blob,
+  // no canvas — nothing that can trigger a WebView crash. The user
+  // long-presses the image that opens to save it to their device.
+  setDlState('error');
+  dlTitle.textContent = 'OPENED IN NEW TAB';
+  dlSub.textContent = reasonText || 'Tap and hold the image that just opened, then choose "Save image" / "Download image" to save it to your device.';
+  try {
+    window.open(src, '_blank', 'noopener');
+  } catch(e) {
+    dlSub.textContent = "Couldn't open automatically. Long-press the image in the chat itself and choose Save image.";
+  }
+}
+
+function timeoutPromise(ms) {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms));
+}
+
 async function downloadImage(src, promptText) {
   const niceName = (promptText || 'NEXUS image').slice(0, 48) + (promptText && promptText.length > 48 ? '…' : '');
   openDownloadModal(niceName);
+
+  const safeName = (promptText || 'nexus-image').toLowerCase()
+    .replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'').slice(0,40) || 'nexus-image';
+
+  let objectUrl = null;
+
   try {
     dlBarFill.style.width = '65%';
-    const res = await fetch(src);
-    if(!res.ok) throw new Error('Network response was not ok');
+
+    // Race the fetch against a timeout. A hung WebView fetch (rather
+    // than a clean rejection) is exactly the scenario that previously
+    // froze/crashed the app — racing it means we always reach the
+    // catch block instead of hanging the whole page.
+    const res = await Promise.race([
+      fetch(src, { mode: 'cors' }),
+      timeoutPromise(9000)
+    ]);
+
+    if(!res || !res.ok) throw new Error('bad-response');
+
     const blob = await res.blob();
+    if(!blob || blob.size === 0) throw new Error('empty-blob');
+
     dlBarFill.style.width = '90%';
-    const url = URL.createObjectURL(blob);
+    objectUrl = URL.createObjectURL(blob);
+
     const a = document.createElement('a');
-    const safeName = (promptText || 'nexus-image').toLowerCase()
-      .replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'').slice(0,40) || 'nexus-image';
-    a.href = url;
+    a.href = objectUrl;
     a.download = `${safeName}.jpg`;
-    document.body.appendChild(a);
+    a.rel = 'noopener';
+    // Not appending to DOM avoids any reflow/layout interaction with
+    // the rest of the page during the click — purely synthetic.
     a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
 
     dlBarFill.style.width = '100%';
     setTimeout(() => {
       setDlState('done');
       dlTitle.textContent = 'SAVED';
       dlSub.textContent = `${safeName}.jpg has been downloaded to your device.`;
-    }, 220);
+    }, 200);
+
   } catch(e) {
-    setDlState('error');
-    dlTitle.textContent = 'DOWNLOAD FAILED';
-    dlSub.textContent = "Couldn't save automatically — opening the image in a new tab so you can save it manually.";
-    window.open(src, '_blank');
+    // ANY failure — network, CORS, timeout, blob issue, WebView quirk —
+    // lands here and falls back to the crash-proof "open in new tab"
+    // path instead of letting the error take down the app.
+    showDownloadFallback(src);
+  } finally {
+    if(objectUrl) {
+      setTimeout(() => { try { URL.revokeObjectURL(objectUrl); } catch(e) {} }, 5000);
+    }
   }
 }
 
@@ -1814,6 +1929,11 @@ MEDIA URL IDENTIFICATION:
 - Extract YouTube video IDs (e.g. ?v=XXXXXXXXXXX or youtu.be/XXXXXXXXXXX) and identify the song/video from your knowledge.
 - If you cannot identify it, tell the user what platform it's from and how to find the song name (e.g. Shazam, checking the video description).
 - Always provide: artist name, song title, album if known.
+
+CODE FORMATTING:
+- Whenever you provide any code, a script, or a snippet of more than a couple lines, ALWAYS wrap it in a markdown fenced code block using triple backticks with the language name, e.g. \`\`\`javascript ... \`\`\`. Never leave code unfenced.
+- Keep explanation/commentary OUTSIDE the code fence — put a short intro sentence before the fence and any follow-up notes after it, but never inline comments-as-prose inside the fence beyond normal code comments.
+- Only one code block per logical script — don't split a single script across multiple fences unless the user asked for multiple separate files.
 
 IMAGE GENERATION CAPABILITY:
 - You CAN generate images. When the user clearly asks you to create, draw, generate, render, or make an image/picture/art of something, respond with a short confirmation sentence followed by exactly one tag on its own line in this exact format:
@@ -1989,17 +2109,39 @@ function startMic() {
   recognizer.continuous = true;
   recognizer.interimResults = true;
 
-  baseTextBeforeRecording = input.value ? (input.value.replace(/\s+$/,'') + ' ') : '';
+  // committedText = everything already typed/spoken and "locked in" before
+  // this listening session started. lastFinalIndex tracks how many results
+  // in the CURRENT recognition session we've already committed, so a
+  // restart (onend -> start again) never re-reads results we already
+  // appended. This is the actual fix for the duplicate-word bug: the old
+  // code rebuilt baseTextBeforeRecording from input.value on every onend,
+  // but on many Android WebView speech engines onresult can still fire
+  // once more for the session that just "ended" (a race between onend and
+  // a trailing onresult), which re-appended the same final transcript on
+  // top of a base that already contained it.
+  let committedText = input.value ? (input.value.replace(/\s+$/,'') + ' ') : '';
+  let lastFinalIndex = 0;
 
   recognizer.onresult = (e) => {
-    let finalText = '';
+    let newFinal = '';
     let interimText = '';
     for(let i=0; i<e.results.length; i++) {
       const r = e.results[i];
-      if(r.isFinal) finalText += r[0].transcript;
-      else interimText += r[0].transcript;
+      if(r.isFinal) {
+        // Only consume results we haven't already committed in this
+        // session — prevents re-adding a final transcript twice.
+        if(i >= lastFinalIndex) {
+          newFinal += r[0].transcript;
+        }
+      } else {
+        interimText += r[0].transcript;
+      }
     }
-    input.value = (baseTextBeforeRecording + finalText + interimText).trim();
+    if(newFinal) {
+      committedText = (committedText + newFinal).replace(/\s+$/,'') + ' ';
+      lastFinalIndex = e.results.length;
+    }
+    input.value = (committedText + interimText).trim();
     input.style.height='auto';
     input.style.height=Math.min(input.scrollHeight,120)+'px';
   };
@@ -2016,7 +2158,11 @@ function startMic() {
   };
 
   recognizer.onend = () => {
-    baseTextBeforeRecording = input.value ? (input.value.replace(/\s+$/,'') + ' ') : '';
+    // Reset the per-session final-result counter for the NEW session
+    // about to start, but keep committedText (already-locked words) as-is
+    // — do not re-derive it from input.value, since interim text may still
+    // be sitting in the box and re-reading it could double it up.
+    lastFinalIndex = 0;
     if(isRecording && !intentionalStop) {
       // mic stayed "on" from the user's perspective — restart listening
       try { recognizer.start(); } catch(e) {}
@@ -2041,7 +2187,7 @@ function stopMic() {
   input.focus();
 }
 
-function appendMsg(role, content, isHTML=false, rawText=null) {
+function appendMsg(role, content, isHTML=false, rawText=null, extraClass=null) {
   const w=document.getElementById('welcomeScreen'); if(w) w.remove();
   const msg=document.createElement('div'); msg.className=`msg ${role}`;
   const avatar=document.createElement('div'); avatar.className='avatar';
@@ -2050,6 +2196,7 @@ function appendMsg(role, content, isHTML=false, rawText=null) {
   const bubbleWrap=document.createElement('div'); bubbleWrap.className='bubble-wrap';
 
   const bubble=document.createElement('div'); bubble.className='bubble';
+  if(extraClass) bubble.classList.add(extraClass);
   if(role==='ai'&&content===null){
     bubble.innerHTML=`<div class="typing-dots"><span></span><span></span><span></span></div>`;
   } else if(isHTML){
@@ -2182,36 +2329,22 @@ async function sendMessage() {
     // Check for an [IMAGE: ...] generation tag from NEXUS
     const imageMatch = reply.match(IMAGE_TAG_REGEX);
     const textPart = reply.replace(IMAGE_TAG_REGEX, '').trim();
-    const replyUrls = extractUrls(textPart);
 
-    const {bubble} = appendMsg('ai','',true,textPart || reply);
-    let i=0;
-    const typeTarget = textPart || reply;
-    const speed=Math.max(5,Math.min(16,800/Math.max(typeTarget.length,1)));
+    // Split into ordered text/code segments so explanation and scripts
+    // land in SEPARATE bubbles — copying a code bubble copies only the
+    // code, never the surrounding text, and order (text → code → text...)
+    // is preserved exactly as the model wrote it.
+    const segments = splitReplyIntoSegments(textPart || reply);
 
-    const finishRender = () => {
-      const cards = buildLinkCards(replyUrls);
-      let finalHTML = renderContent(typeTarget) + (cards?`<div style="margin-top:10px;display:flex;flex-direction:column;gap:6px;">${cards}</div>`:'');
+    if(!segments.length) {
+      // Nothing to show but maybe an image tag
       if(imageMatch) {
-        finalHTML += renderImageCard(imageMatch[1].trim());
+        const {bubble} = appendMsg('ai','',true,'');
+        bubble.innerHTML = renderImageCard(imageMatch[1].trim());
+        chatEl.scrollTop = chatEl.scrollHeight;
       }
-      bubble.innerHTML = finalHTML;
-      chatEl.scrollTop = chatEl.scrollHeight;
-    };
-
-    if(!typeTarget) {
-      finishRender();
     } else {
-      const tick=setInterval(()=>{
-        i++;
-        if(i>=typeTarget.length){
-          clearInterval(tick);
-          finishRender();
-        } else {
-          bubble.textContent=typeTarget.slice(0,i);
-          chatEl.scrollTop=chatEl.scrollHeight;
-        }
-      },speed);
+      await renderSegmentsSequentially(segments, imageMatch);
     }
 
   } catch(err) {
@@ -2220,6 +2353,69 @@ async function sendMessage() {
   }
   sendBtn.disabled=false; input.focus();
 }
+
+// Renders each text/code segment as its own bubble, one after another,
+// with the typewriter effect applied only to text segments (code appears
+// instantly, since "typing out" code char-by-char reads poorly and is slow
+// to scan). The last TEXT segment gets link cards appended; the image tag
+// (if any) always renders attached to the very last bubble.
+function renderSegmentsSequentially(segments, imageMatch) {
+  return new Promise((resolve) => {
+    let idx = 0;
+
+    function next() {
+      if(idx >= segments.length) { resolve(); return; }
+      const seg = segments[idx];
+      const isLast = idx === segments.length - 1;
+      idx++;
+
+      if(seg.type === 'code') {
+        const {bubble} = appendMsg('ai','',true,seg.content,'code-bubble');
+        bubble.innerHTML = buildCodeBubbleHTML(seg.content, seg.lang);
+        chatEl.scrollTop = chatEl.scrollHeight;
+        if(isLast && imageMatch) {
+          const {bubble:imgBubble} = appendMsg('ai','',true,'');
+          imgBubble.innerHTML = renderImageCard(imageMatch[1].trim());
+          chatEl.scrollTop = chatEl.scrollHeight;
+        }
+        setTimeout(next, 90);
+        return;
+      }
+
+      // text segment — typewriter effect
+      const {bubble} = appendMsg('ai','',true,seg.content);
+      const replyUrls = extractUrls(seg.content);
+      let i = 0;
+      const speed = Math.max(5, Math.min(16, 800 / Math.max(seg.content.length,1)));
+
+      const finishRender = () => {
+        const cards = isLast ? buildLinkCards(replyUrls) : '';
+        let finalHTML = renderContent(seg.content) + (cards?`<div style="margin-top:10px;display:flex;flex-direction:column;gap:6px;">${cards}</div>`:'');
+        if(isLast && imageMatch) {
+          finalHTML += renderImageCard(imageMatch[1].trim());
+        }
+        bubble.innerHTML = finalHTML;
+        chatEl.scrollTop = chatEl.scrollHeight;
+        setTimeout(next, 80);
+      };
+
+      if(!seg.content) { finishRender(); return; }
+      const tick = setInterval(()=>{
+        i++;
+        if(i >= seg.content.length){
+          clearInterval(tick);
+          finishRender();
+        } else {
+          bubble.textContent = seg.content.slice(0,i);
+          chatEl.scrollTop = chatEl.scrollHeight;
+        }
+      }, speed);
+    }
+
+    next();
+  });
+}
+
 </script>
 </body>
 </html>
